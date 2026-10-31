@@ -18,7 +18,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-_BLOCK = 8192
+_BLOCK = 4096
 _SCALE = 1024.0  # keeps small fp16 gradients from underflowing; divided out in fp32
 _STATE = threading.local()
 
