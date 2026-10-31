@@ -4,6 +4,9 @@ The logits [rows, 151936] are never kept: rows go through the head 512 at a time
 a chunk of logits and produces per-row loss, entropy, argmax and (in a second pass over the same
 row) the gradient (softmax - onehot) in place; then dh = dlogits @ W. Pad rows are dropped first.
 
+The frozen tied embedding / lm_head is stored in fp16 (checked to be lossless at start-up);
+the embedding output is cast back to fp32, so values stay the same.
+
 Idea source: online softmax (Milakov & Gimelshein, 2018); the idea of chunking the head+loss is
 the general "fused linear cross-entropy" idea. No code copied from other projects.
 """
@@ -18,6 +21,41 @@ import triton.language as tl
 _BLOCK = 4096
 _SCALE = 1024.0  # keeps small fp16 gradients from underflowing; divided out in fp32
 _STATE = threading.local()
+
+ENABLE_EMB16 = True  # False = keep the embedding in fp32 (rollback switch)
+_EMB_DONE = [False]
+
+
+def _shrink_embedding(model):
+    """Frozen tied embedding/lm_head: store fp16 (values identical), embedding output stays fp32."""
+    if _EMB_DONE[0]:
+        return
+    _EMB_DONE[0] = True
+    try:
+        emb = model.get_input_embeddings()
+        w = emb.weight
+        if w.dtype != torch.float32 or w.requires_grad or not w.is_cuda:
+            print("[solution] emb16: skipped (unexpected dtype/grad)")
+            return
+        before = torch.cuda.memory_allocated() >> 20
+        w16 = w.data.to(torch.float16)
+        for i in range(0, w.shape[0], 16384):  # chunked: no big fp32 temporary
+            if not torch.equal(w16[i:i + 16384].float(), w.data[i:i + 16384]):
+                print("[solution] emb16: not lossless, skipped")
+                return
+        w.data = w16
+        orig_forward = emb.forward
+
+        def forward(input_ids, *a, **k):
+            return orig_forward(input_ids, *a, **k).float()
+
+        emb.forward = forward
+        del w16
+        torch.cuda.empty_cache()
+        after = torch.cuda.memory_allocated() >> 20
+        print(f"[solution] emb16: embedding+lm_head now fp16, alloc {before} -> {after} MiB")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[solution] emb16: skipped ({exc!r})")
 
 
 @triton.jit
@@ -167,14 +205,23 @@ def patch_head_loss():
             denom = float((targets != -100).sum().clamp(min=1))
         else:
             denom = float(num_items_in_batch)
-        fwd_inputs = {k: v for k, v in inputs.items() if k not in ("labels", "_prediction_loss_only")}
+        fwd_inputs = {k: v for k, v in inputs.items()
+                      if k not in ("labels", "_prediction_loss_only")}
         fwd_inputs["use_cache"] = False
+        if ENABLE_EMB16:
+            _shrink_embedding(model)
+
+        from . import unpad
+        unpad.set_mask(mask)
+
         _STATE.ctx = {"targets": targets, "valid": valid, "mask": mask, "denom": denom}
         try:
             outputs = model(**fwd_inputs)
         finally:
+            unpad.clear()
             c = _STATE.ctx
             _STATE.ctx = None
+
         res = c.get("result")
         if res is None:
             print("[solution] head_loss: fast path not used, falling back")

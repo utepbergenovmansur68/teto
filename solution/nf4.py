@@ -37,17 +37,19 @@ def _nf4_deq(A, ABS, CODE, OUT, n_bytes, blocksize, BLOCK: tl.constexpr):
 def _nf4_deq2(A, ABS8, CODE2, ABS2, OFF, CODE, OUT, n_bytes, blocksize, bs2,
               BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    idx = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    idx = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)   # индекс байта
     m = idx < n_bytes
     b = tl.load(A + idx, mask=m, other=0).to(tl.int32)
     blk = (idx * 2) // blocksize
     q = tl.load(ABS8 + blk, mask=m, other=0).to(tl.int32)
     s2 = tl.load(ABS2 + blk // bs2, mask=m, other=0.0)
     scale = tl.load(CODE2 + q) * s2 + tl.load(OFF)
-    c_hi = tl.load(CODE + (b >> 4))
-    c_lo = tl.load(CODE + (b & 15))
-    tl.store(OUT + idx * 2, (c_hi * scale).to(OUT.dtype.element_ty), mask=m)
-    tl.store(OUT + idx * 2 + 1, (c_lo * scale).to(OUT.dtype.element_ty), mask=m)
+    j = tl.arange(0, 2)
+    nib = (b[:, None] >> ((1 - j[None, :]) * 4)) & 15      # старший полубайт первым
+    code = tl.load(CODE + nib)
+    val = code * scale[:, None]
+    o = idx[:, None] * 2 + j[None, :]
+    tl.store(OUT + o, val.to(OUT.dtype.element_ty), mask=m[:, None])
                   
 def _code(device):
     key = str(device)
@@ -88,12 +90,13 @@ def patch_bnb_dequant():
         global _BROKEN
         st = quant_state
         if (not _BROKEN and st is not None and absmax is None and out is None
-                and A.is_cuda and A.dtype == torch.uint8 and A.shape[0] != 1
+                and A.is_cuda and A.dtype == torch.uint8
                 and getattr(st, "quant_type", None) == "nf4"
                 and st.dtype in (torch.float16, torch.float32)
                 and st.blocksize % 2 == 0 and st.shape.numel() == 2 * A.numel()):
             try:
-                return dequantize_nf4(A, st)
+                res = dequantize_nf4(A, st)
+                return res.t() if A.shape[0] == 1 else res
             except Exception:  # never break training because of the speed-up
                 _BROKEN = True
         return orig(A, quant_state, absmax, out, blocksize, quant_type)
