@@ -215,7 +215,6 @@ def patch_head_loss():
         unpad.set_mask(mask)
 
         _STATE.ctx = {"targets": targets, "valid": valid, "mask": mask, "denom": denom}
-        torch.cuda.empty_cache()
         try:
             outputs = model(**fwd_inputs)
         finally:
