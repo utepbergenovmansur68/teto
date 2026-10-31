@@ -119,7 +119,7 @@ class _HeadCE(torch.autograd.Function):
             e = min(s + chunk, N)
             logits = h16[s:e] @ w16.t()
             _head_ce[(e - s,)](logits, tgt[s:e], rows[s:e], ent[s:e], arg[s:e], logits.stride(0),
-                               V, gs, IGN=-100, BLOCK=_BLOCK, WRITE_GRAD=need, num_warps=8)
+                               V, gs, IGN=-100, BLOCK=_BLOCK, WRITE_GRAD=need, num_warps=4)
             if need:
                 dh[s:e] = (logits @ w16).to(h.dtype) * (1.0 / _SCALE)
             del logits
@@ -215,6 +215,7 @@ def patch_head_loss():
         unpad.set_mask(mask)
 
         _STATE.ctx = {"targets": targets, "valid": valid, "mask": mask, "denom": denom}
+        torch.cuda.empty_cache()
         try:
             outputs = model(**fwd_inputs)
         finally:
